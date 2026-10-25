@@ -57,3 +57,25 @@ jobs:
 
       - name: Run tests
         run: python -m pytest -v
+
+  build-and-scan:
+    name: Build and scan container image
+    needs: quality-and-tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Build Docker image
+        run: docker build --tag taskforge-api:${{ github.sha }} .
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: taskforge-api:${{ github.sha }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
