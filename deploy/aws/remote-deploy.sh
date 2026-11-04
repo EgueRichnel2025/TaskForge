@@ -14,7 +14,9 @@ PROJECT_NAME="taskforge"
 IMAGE="ghcr.io/eguerichnel2025/taskforge:${DEPLOY_SHA}"
 
 BACKUP_COMPOSE=""
-PREVIOUS_IMAGE_REF=""
+ROLLBACK_OVERRIDE=""
+PREVIOUS_IMAGE_ID=""
+ROLLBACK_IMAGE_TAG=""
 ROLLBACK_ARMED=0
 
 log() {
@@ -31,6 +33,15 @@ compose() {
         --project-name "$PROJECT_NAME" \
         --env-file "$ENV_FILE" \
         --file "$COMPOSE_FILE" \
+        "$@"
+}
+
+compose_rollback() {
+    docker compose \
+        --project-name "$PROJECT_NAME" \
+        --env-file "$ENV_FILE" \
+        --file "$COMPOSE_FILE" \
+        --file "$ROLLBACK_OVERRIDE" \
         "$@"
 }
 
@@ -78,18 +89,14 @@ rollback_on_exit() {
     if [[ "$exit_code" -ne 0 && "$ROLLBACK_ARMED" -eq 1 ]]; then
         log "Deployment failed. Starting automatic rollback."
 
-        if [[ -s "$BACKUP_COMPOSE" ]]; then
+        if [[ -s "$BACKUP_COMPOSE" && -s "$ROLLBACK_OVERRIDE" && -n "$ROLLBACK_IMAGE_TAG" ]]; then
             cp -p "$BACKUP_COMPOSE" "$COMPOSE_FILE"
 
-            if [[ -n "$PREVIOUS_IMAGE_REF" ]]; then
-                export TASKFORGE_IMAGE="$PREVIOUS_IMAGE_REF"
-            else
-                unset TASKFORGE_IMAGE || true
-            fi
+            log "Restoring exact previous image: $ROLLBACK_IMAGE_TAG"
 
-            if compose up -d --no-recreate db \
+            if compose_rollback up -d --pull never --no-recreate db \
                 && wait_for_health db \
-                && compose up -d --no-deps api \
+                && compose_rollback up -d --pull never --no-deps api \
                 && wait_for_health api; then
 
                 log "Rollback completed. Previous application restored."
@@ -98,12 +105,16 @@ rollback_on_exit() {
                 log "Manual inspection of EC2 is required."
             fi
         else
-            log "CRITICAL: Previous Compose configuration is unavailable."
+            log "CRITICAL: Previous deployment backup is incomplete."
         fi
     fi
 
     if [[ -n "$BACKUP_COMPOSE" ]]; then
         rm -f "$BACKUP_COMPOSE"
+    fi
+
+    if [[ -n "$ROLLBACK_OVERRIDE" ]]; then
+        rm -f "$ROLLBACK_OVERRIDE"
     fi
 
     exit "$exit_code"
@@ -178,18 +189,30 @@ if [[ -z "$API_CONTAINER" ]]; then
     fail "Existing TaskForge API container was not found."
 fi
 
-PREVIOUS_IMAGE_REF="$(docker inspect \
-    --format '{{.Config.Image}}' "$API_CONTAINER")"
+PREVIOUS_IMAGE_ID="$(docker inspect \
+    --format '{{.Image}}' "$API_CONTAINER")"
 
-if [[ -z "$PREVIOUS_IMAGE_REF" ]]; then
-    fail "Unable to identify the previous application image."
+if [[ ! "$PREVIOUS_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    fail "Unable to identify the previous application image ID."
 fi
+
+ROLLBACK_IMAGE_TAG="taskforge-rollback:${DEPLOY_SHA:0:12}"
+
+log "Preserving previous image locally: $PREVIOUS_IMAGE_ID"
+
+docker image tag "$PREVIOUS_IMAGE_ID" "$ROLLBACK_IMAGE_TAG"
 
 BACKUP_COMPOSE="$(mktemp "${DEPLOY_DIR}/compose.rollback.XXXXXX")"
 
 cp -p "$COMPOSE_FILE" "$BACKUP_COMPOSE"
 
-log "Previous image: $PREVIOUS_IMAGE_REF"
+ROLLBACK_OVERRIDE="$(mktemp "${DEPLOY_DIR}/compose.rollback.override.XXXXXX")"
+
+printf 'services:\n  api:\n    image: "%s"\n' \
+    "$ROLLBACK_IMAGE_TAG" > "$ROLLBACK_OVERRIDE"
+
+chown root:root "$ROLLBACK_OVERRIDE"
+chmod 600 "$ROLLBACK_OVERRIDE"
 
 # --------------------------------------------------
 # 4. Activate the new deployment
