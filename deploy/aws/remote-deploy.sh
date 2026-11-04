@@ -10,7 +10,12 @@ ENV_FILE="${DEPLOY_DIR}/.env"
 COMPOSE_FILE="${DEPLOY_DIR}/compose.yaml"
 
 PROJECT_NAME="taskforge"
+
 IMAGE="ghcr.io/eguerichnel2025/taskforge:${DEPLOY_SHA}"
+
+BACKUP_COMPOSE=""
+PREVIOUS_IMAGE_REF=""
+ROLLBACK_ARMED=0
 
 log() {
     printf '[TaskForge Deploy] %s\n' "$1"
@@ -21,35 +26,6 @@ fail() {
     exit 1
 }
 
-if [[ "$(id -u)" -ne 0 ]]; then
-    fail "This script must run as root through AWS SSM."
-fi
-
-if [[ ! "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-    fail "A valid 40-character Git commit SHA is required."
-fi
-
-if [[ ! -s "$CANDIDATE_COMPOSE" ]]; then
-    fail "The candidate Docker Compose file is missing or empty."
-fi
-
-if [[ ! -f "$ENV_FILE" ]]; then
-    fail "Production environment file not found."
-fi
-
-ENV_MODE="$(stat -c '%a' "$ENV_FILE")"
-ENV_OWNER="$(stat -c '%U:%G' "$ENV_FILE")"
-
-if [[ "$ENV_MODE" != "600" || "$ENV_OWNER" != "root:root" ]]; then
-    fail "Production environment file permissions are incorrect."
-fi
-
-if ! docker volume inspect taskforge_postgres_data >/dev/null 2>&1; then
-    fail "Existing PostgreSQL volume was not found. Refusing deployment."
-fi
-
-export TASKFORGE_IMAGE="$IMAGE"
-
 compose() {
     docker compose \
         --project-name "$PROJECT_NAME" \
@@ -57,30 +33,6 @@ compose() {
         --file "$COMPOSE_FILE" \
         "$@"
 }
-
-log "Validating deployment configuration."
-
-docker compose \
-    --project-name "$PROJECT_NAME" \
-    --env-file "$ENV_FILE" \
-    --file "$CANDIDATE_COMPOSE" \
-    config --quiet
-
-log "Pulling application image: $IMAGE"
-
-docker compose \
-    --project-name "$PROJECT_NAME" \
-    --env-file "$ENV_FILE" \
-    --file "$CANDIDATE_COMPOSE" \
-    pull api
-
-log "Installing validated Compose configuration."
-
-install -o root -g root -m 0644 \
-    "$CANDIDATE_COMPOSE" \
-    "${COMPOSE_FILE}.new"
-
-mv -f "${COMPOSE_FILE}.new" "$COMPOSE_FILE"
 
 wait_for_health() {
     local service="$1"
@@ -118,15 +70,148 @@ wait_for_health() {
     return 1
 }
 
+rollback_on_exit() {
+    local exit_code=$?
+
+    trap - EXIT
+
+    if [[ "$exit_code" -ne 0 && "$ROLLBACK_ARMED" -eq 1 ]]; then
+        log "Deployment failed. Starting automatic rollback."
+
+        if [[ -s "$BACKUP_COMPOSE" ]]; then
+            cp -p "$BACKUP_COMPOSE" "$COMPOSE_FILE"
+
+            if [[ -n "$PREVIOUS_IMAGE_REF" ]]; then
+                export TASKFORGE_IMAGE="$PREVIOUS_IMAGE_REF"
+            else
+                unset TASKFORGE_IMAGE || true
+            fi
+
+            if compose up -d --no-recreate db \
+                && wait_for_health db \
+                && compose up -d --no-deps api \
+                && wait_for_health api; then
+
+                log "Rollback completed. Previous application restored."
+            else
+                log "CRITICAL: Automatic rollback failed."
+                log "Manual inspection of EC2 is required."
+            fi
+        else
+            log "CRITICAL: Previous Compose configuration is unavailable."
+        fi
+    fi
+
+    if [[ -n "$BACKUP_COMPOSE" ]]; then
+        rm -f "$BACKUP_COMPOSE"
+    fi
+
+    exit "$exit_code"
+}
+
+trap rollback_on_exit EXIT
+
+# --------------------------------------------------
+# 1. Validate deployment prerequisites
+# --------------------------------------------------
+
+if [[ "$(id -u)" -ne 0 ]]; then
+    fail "This script must run as root through AWS SSM."
+fi
+
+if [[ ! "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+    fail "A valid 40-character Git commit SHA is required."
+fi
+
+if [[ ! -s "$CANDIDATE_COMPOSE" ]]; then
+    fail "Candidate Docker Compose file is missing or empty."
+fi
+
+if [[ ! -f "$ENV_FILE" ]]; then
+    fail "Production environment file not found."
+fi
+
+if [[ ! -f "$COMPOSE_FILE" ]]; then
+    fail "Existing Docker Compose configuration not found."
+fi
+
+ENV_MODE="$(stat -c '%a' "$ENV_FILE")"
+ENV_OWNER="$(stat -c '%U:%G' "$ENV_FILE")"
+
+if [[ "$ENV_MODE" != "600" || "$ENV_OWNER" != "root:root" ]]; then
+    fail "Production environment file permissions are incorrect."
+fi
+
+if ! docker volume inspect taskforge_postgres_data >/dev/null 2>&1; then
+    fail "Existing PostgreSQL volume was not found. Refusing deployment."
+fi
+
+export TASKFORGE_IMAGE="$IMAGE"
+
+log "Validating candidate Docker Compose configuration."
+
+docker compose \
+    --project-name "$PROJECT_NAME" \
+    --env-file "$ENV_FILE" \
+    --file "$CANDIDATE_COMPOSE" \
+    config --quiet
+
+# --------------------------------------------------
+# 2. Prepare the new image
+# --------------------------------------------------
+
+log "Pulling application image: $IMAGE"
+
+docker compose \
+    --project-name "$PROJECT_NAME" \
+    --env-file "$ENV_FILE" \
+    --file "$CANDIDATE_COMPOSE" \
+    pull api
+
+# --------------------------------------------------
+# 3. Capture the previous deployment
+# --------------------------------------------------
+
+API_CONTAINER="$(compose ps -q api)"
+
+if [[ -z "$API_CONTAINER" ]]; then
+    fail "Existing TaskForge API container was not found."
+fi
+
+PREVIOUS_IMAGE_REF="$(docker inspect \
+    --format '{{.Config.Image}}' "$API_CONTAINER")"
+
+if [[ -z "$PREVIOUS_IMAGE_REF" ]]; then
+    fail "Unable to identify the previous application image."
+fi
+
+BACKUP_COMPOSE="$(mktemp "${DEPLOY_DIR}/compose.rollback.XXXXXX")"
+
+cp -p "$COMPOSE_FILE" "$BACKUP_COMPOSE"
+
+log "Previous image: $PREVIOUS_IMAGE_REF"
+
+# --------------------------------------------------
+# 4. Activate the new deployment
+# --------------------------------------------------
+
+install -o root -g root -m 0644 \
+    "$CANDIDATE_COMPOSE" \
+    "${COMPOSE_FILE}.new"
+
+ROLLBACK_ARMED=1
+
+mv -f "${COMPOSE_FILE}.new" "$COMPOSE_FILE"
+
 log "Ensuring PostgreSQL is running."
 
-compose up -d db
+compose up -d --no-recreate db
 
 if ! wait_for_health db; then
     fail "PostgreSQL did not become healthy."
 fi
 
-log "Starting the TaskForge API."
+log "Starting TaskForge API."
 
 compose up -d --no-deps api
 
@@ -134,7 +219,11 @@ if ! wait_for_health api; then
     fail "TaskForge API did not become healthy."
 fi
 
-log "Running final HTTP health checks."
+# --------------------------------------------------
+# 5. Final application checks
+# --------------------------------------------------
+
+log "Running HTTP health checks."
 
 curl --fail --silent --show-error \
     http://127.0.0.1:8000/health
@@ -146,7 +235,9 @@ curl --fail --silent --show-error \
 
 printf '\n'
 
+compose ps
+
 log "Deployment completed successfully."
 log "Image: $IMAGE"
 
-compose ps
+ROLLBACK_ARMED=0
