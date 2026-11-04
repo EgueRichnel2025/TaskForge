@@ -102,8 +102,24 @@ fi
 
 log "Checking GHCR image availability."
 
-docker manifest inspect "$IMAGE" >/dev/null \
-    || fail "Docker image is not available on GHCR."
+REGISTRY_IMAGE_CHECKED=0
+
+for attempt in 1 2 3; do
+    if docker buildx imagetools inspect "$IMAGE" >/dev/null 2>&1; then
+        REGISTRY_IMAGE_CHECKED=1
+        break
+    fi
+
+    log "GHCR inspection failed (attempt ${attempt}/3)."
+
+    if [[ "$attempt" -lt 3 ]]; then
+        sleep "$((attempt * 5))"
+    fi
+done
+
+if [[ "$REGISTRY_IMAGE_CHECKED" -ne 1 ]]; then
+    fail "Unable to verify image on GHCR after three attempts. Check network connectivity and registry access."
+fi
 
 log "Validating AWS Docker Compose configuration."
 
